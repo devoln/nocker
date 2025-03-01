@@ -1,0 +1,69 @@
+#!/bin/sh
+SCRIPT_DIR=$(dirname "$0")
+SCRIPT_NAME=$(basename "$0")
+. "$SCRIPT_DIR/nk-lib.sh"
+
+mkdir -p "$IMAGES_DIR" "$CONTAINERS_DIR"
+
+case "$1" in
+    pull)
+        shift
+        nk-pull "$@"
+        ;;
+    run|start|exec|stop|restart|attach|logs|inspect|ps|rm|kill)
+        cmd="nk_$1"
+        shift
+        $cmd "$@"
+        ;;
+    container)
+        case "$2" in
+            run|start|exec|stop|restart|attach|logs|inspect|prune|kill)
+                cmd="nk_$2"
+                shift 2
+                $cmd "$@"
+                ;;
+            ps|ls|list)
+                shift 2
+                dk_ps "$@"
+                ;;
+            rm|remove)
+                shift 2
+                dk_rm "$@"
+                ;;
+            *)
+                echo "Unsupported container command: $2"
+                exit 1
+                ;;
+        esac
+        ;;
+    image)
+        case "$2" in
+            pull)
+                shift 2
+                nk-pull "$@"
+                ;;
+            *)
+                echo "Unsupported image command: $2"
+                exit 1
+                ;;
+        esac
+        ;;
+    layer)
+        case "$2" in
+            prune)
+                shift 2
+                nk_layer_prune "$@"
+                ;;
+            *)
+                echo "Unsupported layer command: $2"
+                exit 1
+                ;;
+        esac
+        ;;
+    *)
+        echo "Usage: $SCRIPT_NAME {pull|run|start|exec|ps|stop|restart|attach|logs|inspect} ..."
+        echo "       $SCRIPT_NAME container {run|start|exec|stop|restart|attach|logs|inspect|ls|list|ps|prune} ..."
+        echo "       $SCRIPT_NAME image pull ..."
+        exit 1
+        ;;
+esac
