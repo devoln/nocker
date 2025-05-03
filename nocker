@@ -1,16 +1,2248 @@
 #!/bin/sh
-SCRIPT_DIR=$(dirname "$0")
-SCRIPT_NAME=$(basename "$0")
-. "$SCRIPT_DIR/nk-lib.sh"
+
+REGISTRY_URL=${REGISTRY_URL:-https://registry-1.docker.io}
+
+if [ -n "$NOCKER_ROOT" ]; then
+	NOCKER_ROOT="$NOCKER_ROOT"
+elif [ "$(id -u)" -eq 0 ]; then
+	NOCKER_ROOT="/var/lib/nocker"
+else
+	NOCKER_ROOT="$HOME/.local/share/nocker"
+fi
+
+DEV_PASSTHROUGH=${DEV_PASSTHROUGH:-""}
+
+GLOBAL_LAYERS_DIR="$NOCKER_ROOT/global_layers"
+REL_GLOBAL_LAYERS_DIR="../../../../../global_layers"
+
+LOG_FILE="$NOCKER_ROOT/nocker.log"
+
+IMAGES_DIR="$NOCKER_ROOT/images"
+CONTAINERS_DIR="$NOCKER_ROOT/containers"
+
+PROOT_BIN=${PROOT_BIN:-proot}
+JQ_BIN=${JQ_BIN:-jq}
 
 mkdir -p "$IMAGES_DIR" "$CONTAINERS_DIR"
 
+USE_OVERLAYFS=$( [ "$(id -u)" -eq 0 ] && (grep -q overlay /proc/filesystems || modprobe overlay 2> /dev/null) && echo 1 || echo 0 )
+#echo Use overlay: "$USE_OVERLAYFS"
+
+shell_quote() {
+  if [ -z "$1" ]; then
+	printf "''"
+  else
+	printf "'%s'" "$(printf "%s" "$1" | sed "s/'/'\\\\''/g")"
+  fi
+}
+
+log() {
+	#echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE" >&2
+	msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+	echo "$msg" >&2
+	echo "$msg" >> "$LOG_FILE"
+}
+
+log_verbose() {
+	if [ "$NOCKER_VERBOSE" = 1 ]; then
+		log "$@"
+	fi
+}
+
+time_ago() {
+	timestamp=$(echo "$1" | tr 'T' ' ')
+	now=$(date +%s)
+	past=$(date -ud "$timestamp" +%s)
+	diff=$((now - past))
+	
+	if [ $diff -lt 60 ]; then
+		echo "${diff} seconds ago"
+	elif [ $diff -lt 3600 ]; then
+		echo "$((diff/60)) minutes ago"
+	elif [ $diff -lt 86400 ]; then
+		echo "$((diff/3600)) hours ago"
+	else
+		echo "$((diff/86400)) days ago"
+	fi
+}
+
+http_get() {
+	URL="$1"
+	OUTPUT="$2"
+	shift 2
+	
+	if which curl >/dev/null 2>&1; then
+		CMD="curl -f -sSL"
+		for arg in "$@"; do
+			CMD="$CMD -H \"$arg\""
+		done
+		CMD="$CMD \"$URL\" -o \"$OUTPUT\""
+		eval "$CMD" || return 1
+	elif which wget >/dev/null 2>&1; then
+		CMD="wget"
+		for arg in "$@"; do
+			CMD="$CMD --header=\"$arg\""
+		done
+		CMD="$CMD -qO \"$OUTPUT\" \"$URL\""
+		eval "$CMD" || return 1
+	else
+		error "Neither curl, nor wget were found."
+		return 1
+	fi
+}
+
+http_get_auth() {
+	http_get "$1" "$2" "Authorization: Bearer $TOKEN" "$@"
+}
+
+parse_image_input() {
+	case "$1" in
+		*:*)
+			REPO=$(echo "$1" | cut -d':' -f1)
+			TAG=$(echo "$1" | cut -d':' -f2)
+			;;
+		*)
+			REPO="$1"
+			TAG="latest"
+			;;
+	esac
+
+	case "$REPO" in
+		*/*)
+			REPO_FULL="$REPO"
+			;;
+		*)
+			REPO_FULL="library/$REPO"
+			;;
+	esac
+}
+
+kill_wait() {
+	pid=$1
+	timeout=$2
+
+	kill "$pid"
+	while [ $timeout -gt 0 ]; do
+		if kill -0 "$pid" 2>/dev/null; then
+			sleep 1
+			timeout=$((timeout - 1))
+		else
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+kill_wait_group() {
+	pgid=$1
+	timeout=$2
+
+	kill -- -$pgid || return 0
+	while [ $timeout -gt 0 ]; do
+		if ps -o pgid | grep -q -w $pgid; then
+			sleep 1
+			timeout=$((timeout - 1))
+		else
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+prompt_confirmation() {
+	prompt="${1:-Are you sure you want to continue?}"
+	printf "%s [y/N] " "$prompt" >&2
+	read -r answer
+	case "$answer" in
+		[yY]) return 0;;
+		*)     return 1;;
+	esac
+}
+
+parse_image_config() {
+    parse_image_input "$1"
+    user_cmd="$2"
+    
+    config_file="$IMAGES_DIR/$REPO_FULL/$TAG/config.json"
+    if [ ! -f "$config_file" ]; then
+        log "Error: config.json not found for image $image"
+        exit 1
+    fi
+
+    config_cmd=$($JQ_BIN -r '.config.Cmd // [] | map("\"\(.)\"") | join(" ")' "$config_file")
+    config_entrypoint=$($JQ_BIN -r '.config.Entrypoint // [] | join(" ")' "$config_file")
+    config_env=$($JQ_BIN -r '.config.Env // [] | join("\n")' "$config_file")
+    config_workdir=$($JQ_BIN -r '.config.WorkingDir // ""' "$config_file")
+    config_user=$($JQ_BIN -r '.config.User // "0"' "$config_file")
+
+    env_vars=""
+    if [ -n "$config_env" ]; then
+        while IFS= read -r line; do
+            env_vars="$env_vars $line"
+        done <<EOF
+$config_env
+EOF
+    fi
+
+    if [ -n "$user_cmd" ]; then
+        final_cmd="$user_cmd"
+    elif [ -n "$config_entrypoint" ]; then
+        final_cmd="$config_entrypoint $config_cmd"
+    else
+        final_cmd="$config_cmd"
+    fi
+	log_verbose "image config final_cmd: $final_cmd"
+
+    #final_cmd=$(echo "$final_cmd" | sed "s/['\"]//g")
+    echo "${env_vars# }|$config_workdir|$config_user|$final_cmd"
+}
+
+save_image_config() {
+    config_file="$1"
+    
+    # env_vars string to JSON
+    if [ -n "$env_vars" ]; then
+        env_array="["
+        OLDIFS="$IFS"
+        IFS=" "
+        for var in $env_vars; do
+            escaped_var=$(echo "$var" | sed 's/"/\\"/g') # escape double quotes
+            env_array="$env_array\"$escaped_var\","
+        done
+        IFS="$OLDIFS"
+        env_array="${env_array%,}]"
+    else
+        env_array="[]"
+    fi
+    
+    # config_cmd from string to JSON array
+    if [ -n "$config_cmd" ]; then
+        cmd_array="["
+        tmp_cmd=$(mktemp)
+        echo "$config_cmd" | sed 's/"\([^"]*\)"/\1\n/g' > "$tmp_cmd"
+        while read -r part; do
+            if [ -n "$part" ]; then
+                escaped_part=$(echo "$part" | sed 's/"/\\"/g') # escape double quotes
+                cmd_array="$cmd_array\"$escaped_part\","
+            fi
+        done < "$tmp_cmd"
+        rm -f "$tmp_cmd"
+        cmd_array="${cmd_array%,}]"
+        if [ "$cmd_array" = "[]" ]; then
+            cmd_array="null"
+        fi
+    else
+        cmd_array="null"
+    fi
+    
+    # config_entrypoint from string to JSON array
+    if [ -n "$config_entrypoint" ]; then
+        entrypoint_array="["
+        OLDIFS="$IFS"
+        IFS=" "
+        for part in $config_entrypoint; do
+            escaped_part=$(echo "$part" | sed 's/"/\\"/g') # escape double quotes
+            entrypoint_array="$entrypoint_array\"$escaped_part\","
+        done
+        IFS="$OLDIFS"
+        entrypoint_array="${entrypoint_array%,}]"
+        if [ "$entrypoint_array" = "[]" ]; then
+            entrypoint_array="null"
+        fi
+    else
+        entrypoint_array="null"
+    fi
+    
+    $JQ_BIN -n \
+       --arg user "$config_user" \
+       --arg workdir "$config_workdir" \
+       --argjson env "$env_array" \
+       --argjson cmd "$config_cmd" \
+       --argjson entrypoint "$config_entrypoint" \
+       '{"config": {"User": $user, "WorkingDir": $workdir, "Env": $env, "Cmd": $cmd, "Entrypoint": $entrypoint}}' > "$config_file"
+    
+    if [ "$?" -ne 0 ]; then
+        log "Error: Failed to save config to $config_file"
+        return 1
+    fi
+    
+    return 0
+}
+
+copy_image() {
+	parse_image_input "$1"
+	src_image_dir="$IMAGES_DIR/$REPO_FULL/$TAG"
+	parse_image_input "$2"
+	dst_image_dir="$IMAGES_DIR/$REPO_FULL/$TAG"
+
+	cp -R "$src_image_dir" "$dst_image_dir"
+}
+
+set_lower_dirs_for_image() {
+	layers_dir="$1"
+
+	temp_file=$(mktemp)
+	lower_dirs=""
+	#log_verbose "find: $(find "$layers_dir" -maxdepth 1 -mindepth 1 -type l -o -type d)"
+	#find "$layers_dir" -maxdepth 1 -mindepth 1 -type l -o -type d | sort -V > "$temp_file"
+	#find "$layers_dir" -mindepth 1 -maxdepth 1 \( -type l -o -type d \) | sort -V > "$temp_file"
+	: > "$temp_file"
+	for path in "$layers_dir"/*; do
+		[ -e "$path" ] || continue
+		[ -L "$path" ] || [ -d "$path" ] || continue
+		echo "$path" >> "$temp_file"
+	done
+	sort -n "$temp_file" -o "$temp_file"
+
+	while IFS= read -r layer; do
+		log_verbose "layer: $layer"
+		layer_path="$layer"
+		[ -d "$layer_path" ] || continue
+		
+		if [ -z "$lower_dirs" ]; then
+			lower_dirs="$layer_path"
+		else
+			lower_dirs="$layer_path:$lower_dirs"
+		fi
+	done < "$temp_file"
+	rm -f "$temp_file"
+
+	log_verbose "lower_dirs for $layers_dir: $lower_dirs"
+}
+
+mount_image_dir_layers_overlay() {
+	container_dir="$1"
+	layers_dir="$2"
+
+	set_lower_dirs_for_image "$layers_dir"
+
+	if [ -z "$lower_dirs" ]; then
+		log "error: No layers found for image in $layers_dir ($layers_dir)"
+		return
+	fi
+
+	log_verbose layers_dir: "$layers_dir"
+	#ls "$layers_dir"
+	log_verbose lower_dirs: "$lower_dirs"
+	mkdir -p "$container_dir/merged" "$container_dir/upper" "$container_dir/work"
+	mount -t overlay overlay \
+		-o "lowerdir=$lower_dirs,upperdir=$container_dir/upper,workdir=$container_dir/work" \
+		"$container_dir/merged" 2>/dev/null
+}
+
+mount_image_dir_layers_vfs() {
+	container_dir="$1"
+	layers_dir="$2"
+
+	set_lower_dirs_for_image "$layers_dir"
+
+	if [ -z "$lower_dirs" ]; then
+		return
+	fi
+
+	merged_dir="$container_dir/merged"
+	mkdir -p "$merged_dir"
+	#if [ -n "$(find "$merged_dir" -maxdepth 0 -type d -empty 2>/dev/null)" ]; then
+	if [ -d "$merged_dir" ] && [ -z "$(ls -A "$merged_dir" 2>/dev/null)" ]; then
+		# if directory is empty (otherwise assume it already contains the right rootfs)
+		log "WARNING: Using slow copy method instead of overlayfs"
+		echo "$lower_dirs" | tr ':' '\n' | sed '1!G;h;$!d' | while read -r layer; do
+			cp -af "$layer/." "$merged_dir"
+		done
+	else
+		log_verbose "mount_image_dir_layers_vfs: skipping non-empty $merged_dir with the previous content: $(ls -lh "$merged_dir")"
+	fi
+}
+
+mount_image_dir_layers() {
+	container_dir="$1"
+	layers_dir="$2"
+
+	if [ "$USE_OVERLAYFS" -eq 1 ]; then
+		mount_image_dir_layers_overlay "$container_dir" "$layers_dir"
+	else
+		mount_image_dir_layers_vfs "$container_dir" "$layers_dir"
+	fi
+
+	mkdir -p "$container_dir/merged/etc"
+	for file in resolv.conf host.conf hosts nsswitch.conf; do
+		cp "/etc/$file" "$container_dir/merged/etc/" > /dev/null 2>&1
+	done
+	cp /run/systemd/resolve/resolv.conf "$container_dir/merged/etc/" > /dev/null 2>&1
+}
+
+mount_image_layers() {
+	parse_image_input "$1"
+	container_dir=$2
+	layers_dir="$IMAGES_DIR/$REPO_FULL/$TAG/layers"
+	lower_dirs=""
+	
+	mount_image_dir_layers "$container_dir" "$layers_dir"
+}
+
+generate_id() {
+	echo "$1$(date +%s%N)" | sha1sum | cut -d " " -f1
+}
+
+generate_container_id() {
+	generate_id "container_"
+}
+
+generate_image_id() {
+	generate_id "image_"
+}
+
+save_metadata() {
+	container_dir=$1
+	container_id=$2
+	image=$3
+	final_cmd=$4
+	workdir=$5
+	env_vars=$6
+	user=$7
+	restart_policy=$8
+	attach_session=$9
+	volumes=${10}
+	ports=${11}
+
+	meta="$container_dir/metadata.json"
+	mkdir -p "$(dirname "$meta")"
+	cat <<EOF > "$meta"
+{
+	"id": "$container_id",
+	"image": "$image",
+	"command": "$(echo "$final_cmd" | sed 's/"/\\"/g')",
+	"workdir": "$(echo "$workdir" | sed 's/"/\\"/g')",
+	"env": ["$(echo "$env_vars" | sed 's/ /","/g')"],
+	"user": "$(echo "$user" | sed 's/"/\\"/g')",
+	"restart_policy": "$restart_policy",
+	"created": "$(date -u +%Y-%m-%dT%H:%M:%S)",
+	"exited_at": "never",
+	"exit_code": -1,
+	"status": "running",
+	"pid": "$$",
+	"attach_session": "$attach_session",
+	"volumes": "$volumes",
+	"ports": "$ports"
+}
+EOF
+	#cat "$meta"
+}
+
+run_in_container() {
+	container_id=$1
+	workdir=$2
+	env_vars=$3
+	user=$4
+	interactive=$5
+	tty_flag=$6
+	volumes=$7
+	ports=$8
+	is_main_process=$9
+	shift 9
+	merged_dir="$CONTAINERS_DIR/$container_id/merged"
+	command="$*"
+
+	mkdir -p /tmp/nocker_$container_id
+	mkdir -p /run/shm/nocker_$container_id 2>/dev/null
+	if [ -n "$?" ]; then
+		mkdir -p /dev/shm/nocker_$container_id
+		SHM_DIR=/dev/shm
+	else
+		SHM_DIR=/run/shm
+	fi
+
+	log_verbose "run_in_container: env_vars (before): $set_env_vars $arg_vars"
+
+	(
+		if [ "$(id -u)" -eq 0 ]; then
+			volumes="$volumes"
+			if [ "$DEV_PASSTHROUGH" = "all" ]; then
+				volumes="$volumes /dev:/dev"
+			else
+				mkdir -p "$merged_dir/dev" "$merged_dir/dev/net" "$merged_dir/proc" "$merged_dir/sys"
+				mknod -m 666 "$merged_dir/dev/null"     c 1 3
+				mknod -m 666 "$merged_dir/dev/zero"     c 1 5
+				mknod -m 666 "$merged_dir/dev/full"     c 1 7
+				mknod -m 666 "$merged_dir/dev/random"   c 1 8
+				mknod -m 666 "$merged_dir/dev/urandom"  c 1 9
+				mknod -m 620 "$merged_dir/dev/tty0"     c 4 0
+				mknod -m 666 "$merged_dir/dev/tty"      c 5 0
+				mknod -m 600 "$merged_dir/dev/console"  c 5 1
+				mknod -m 666 "$merged_dir/dev/ptmx"     c 5 2
+				mknod -m 660 "$merged_dir/dev/loop0"    c 7 0
+				mknod -m 666 "$merged_dir/dev/net/tun"  c 10 200
+				mknod -m 666 "$merged_dir/dev/fuse"     c 10 229
+			fi
+			mkdir -p "$merged_dir/proc" "$merged_dir/sys" "$merged_dir/dev/pts" "$merged_dir/dev/mqueue"
+			mount -t proc proc "$merged_dir/proc"
+			mount -t sysfs sysfs "$merged_dir/sys"
+			mount -t devpts -o newinstance devpts "$merged_dir/dev/pts"
+			mount -t mqueue mqueue "$merged_dir/dev/mqueue" 2> /dev/null
+
+			log_verbose "$volumes"
+			for vol in $volumes; do
+				#log "$vol"
+				host_path=$(echo "$vol" | cut -d: -f1)
+				container_path=$(echo "$vol" | cut -d: -f2)
+				mkdir -p "$merged_dir$container_path"
+				mount --bind "$host_path" "$merged_dir$container_path"
+			done
+
+			if [ -x "$merged_dir/bin/sh" ]; then
+				if [ -x "$merged_dir/bin/su" ]; then
+					CMD="$(which chroot) \"$merged_dir\" /bin/su $(awk -F: -v uid="$user" '$3 == uid {print $1; exit}' "$merged_dir/etc/passwd") -c $(shell_quote "cd ${workdir:-/} && exec $command")"
+				else
+					CMD="$(which chroot) \"$merged_dir\" /bin/sh -c \"cd ${workdir:-/} && exec $command\""
+				fi
+			else
+				CMD="$(which chroot) \"$merged_dir\" $command"
+			fi
+			need_umount=1
+		else
+			proot_cmd="$PROOT_BIN -i $user:$user -r \"$merged_dir\" -b /tmp/nocker_$container_id:/tmp -b $SHM_DIR/nocker_$container_id:/run/shm -b /proc -b /sys -b /dev --kill-on-exit -w \"${workdir:-/}\""
+			for vol in $volumes; do
+				proot_cmd="$proot_cmd -b $vol"
+			done
+
+			for port in $ports; do
+				if [ "${port#*:}" != "$port" ]; then
+					host_port=${port%:*}
+					container_port=${port#*:}
+					proot_cmd="$proot_cmd -p ${container_port}:${host_port}"
+				else
+					proot_cmd="$proot_cmd -p $port"
+				fi
+			done
+
+			CMD="$proot_cmd $command"
+		fi
+		CMD="exec $CMD"
+
+		meta="$CONTAINERS_DIR/$container_id/metadata.json"
+		if [ "$is_main_process" = "true" ]; then
+			CMD="$JQ_BIN --arg pid \"\$\$\" '.pid = (\$pid|tonumber) | .status = \"running\"' \"$meta\" > tmp && mv tmp \"$meta\"; $CMD"
+		fi
+
+		log_verbose "env_vars (after): $env_vars"
+		log_verbose "$CMD"
+
+		sh_bin=$(which sh)
+
+		# unexport all host variables
+		unset IFS
+		for var in $(env | cut -d'=' -f1); do
+			#log_verbose "value=\"\$$var\""
+			eval "value=\"\$$var\""
+			unset -v "$var"
+			#log_verbose "$var=\"\$value\""
+			eval "$var=\"\$value\""
+		done
+
+		if [ "$tty_flag" = 1 ]; then
+			export TERM=xterm
+		fi
+		if [ "$user" = 0 ]; then
+			export HOME=/root
+		else
+			export HOME=/
+		fi
+		export HOSTNAME="$container_id"
+
+		for var in $env_vars; do
+			#log_verbose export "${var?}"
+			export "${var?}"
+		done
+
+		#log "env_vars2: $env_vars"
+
+		if which setsid >/dev/null 2>&1; then
+			if [ "$interactive" = 0 ]; then
+				setsid "$sh_bin" -c "$CMD" < /dev/null
+			else
+				setsid "$sh_bin" -c "$CMD"
+			fi
+		else
+			echo "WARN: no setsid"
+			if [ "$interactive" = 0 ]; then
+				$sh_bin -c "$CMD" < /dev/null
+			else
+				$sh_bin -c "$CMD"
+			fi
+		fi
+		
+		exit_code=$?
+
+		if [ "$is_main_process" = "true" ]; then
+			exited_at=$(date -u +"%Y-%m-%dT%H:%M:%S")
+			$JQ_BIN --arg exited_at "$exited_at" --arg code "$exit_code" '.status = "exited" | .exited_at = $exited_at | .exit_code = $code' "$meta" > tmp && mv tmp "$meta"
+		fi
+
+		# Undo previous mount --bind calls
+		if [ -n "$need_umount" ]; then
+			for vol in $volumes; do
+				path_in_container=$(echo "$vol" | cut -d: -f2)
+				log_verbose "umount 2 $merged_dir$path_in_container"
+				umount -lf "$merged_dir$path_in_container"
+			done
+			for path_in_container in /proc /sys /dev/pts /dev/mqueue; do
+				log_verbose "umount 2 $merged_dir$path_in_container"
+				umount -lf "$merged_dir$path_in_container" 2> /dev/null
+			done
+		fi
+		return $exit_code
+	)
+	return $?
+}
+
+cleanup_container() {
+	container_dir=$1
+
+	meta="$container_dir/metadata.json"
+	if [ "$(id -u)" -eq 0 ]; then
+		umount -lf "$container_dir/merged/dev" "$container_dir/merged/sys" "$container_dir/merged/proc" 2> /dev/null
+	fi
+	if [ "$USE_OVERLAYFS" -eq 1 ]; then
+		umount -lf "$container_dir/merged" 2> /dev/null
+	fi
+}
+
+find_container() {
+	prefix=$1
+	matches=$(find "$CONTAINERS_DIR/$prefix"* -maxdepth 1 -name metadata.json 2>/dev/null)
+	
+	if [ -z "$matches" ]; then
+		echo "Error: No such container: $prefix" >&2
+		return 1
+	elif [ "$(echo "$matches" | wc -l)" -gt 1 ]; then
+		echo "Error: multiple IDs found with provided prefix: '$prefix':" >&2
+		for file in $matches; do basename "$(dirname "$file")"; done | sed 's/^/  /' >&2
+		return 2
+	fi
+	basename "$(dirname "$matches")"
+}
+
+nk_pull() {
+	error() {
+		echo "Error: $1" >&2
+		rm -Rf "$IMAGE_DIR"
+		exit 1
+	}
+
+	if [ -z "$1" ]; then
+		echo "Usage: $0 <image>[:tag]"
+		exit 1
+	fi
+
+	parse_image_input "$1"
+
+	echo "Downloading image $REPO_FULL:$TAG"
+
+	IMAGE_DIR="$IMAGES_DIR/$REPO_FULL/$TAG"
+	LAYERS_DIR="$IMAGE_DIR/layers"
+	MANIFEST_FILE="$IMAGE_DIR/manifest.json"
+
+	mkdir -p "$LAYERS_DIR" || error "Failed to create directory $LAYERS_DIR"
+
+	AUTH_URL="https://auth.docker.io/token?service=registry.docker.io&scope=repository:${REPO_FULL}:pull"
+	TOKEN_RESP="$(mktemp)"
+	if ! http_get "$AUTH_URL" "$TOKEN_RESP"; then
+		rm -f "$TOKEN_RESP"
+		error "Failed to acquire token from $AUTH_URL"
+	fi
+
+	TOKEN=$($JQ_BIN -r '.token' "$TOKEN_RESP")
+	rm "$TOKEN_RESP"
+
+	if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+		error "Failed to extract token from an authorization response."
+	fi
+
+	HOST_ARCH=$(uname -m)
+	case "$HOST_ARCH" in
+		x86_64)
+			TARGET_ARCH="amd64"
+			;;
+		aarch64|arm64)
+			TARGET_ARCH="arm64"
+			TARGET_VARIANT="v8"
+			;;
+		armv7l)
+			TARGET_ARCH="arm"
+			TARGET_VARIANT="v7"
+			;;
+		armv6l)
+			TARGET_ARCH="arm"
+			TARGET_VARIANT="v6"
+			;;
+		*)
+			TARGET_ARCH="$HOST_ARCH"
+			;;
+	esac
+	#echo "Host architecture: $HOST_ARCH -> choose: $TARGET_ARCH"
+
+	MANIFEST_URL="$REGISTRY_URL/v2/${REPO_FULL}/manifests/${TAG}"
+	TMP_MANIFEST="$(mktemp)"
+	http_get_auth "$MANIFEST_URL" "$TMP_MANIFEST" "application/vnd.docker.distribution.manifest.list.v2+json" || true
+
+	if [ ! -s "$TMP_MANIFEST" ]; then
+		rm -f "$TMP_MANIFEST"
+		error "Failed to load manifest list from $MANIFEST_URL. It either doesn't exist or the tag $TAG is invalid."
+	fi
+
+	if $JQ_BIN -e '.manifests' "$TMP_MANIFEST" >/dev/null 2>&1; then
+		#echo "Got manifest list. Looking for $TARGET_ARCH manifest..."
+		if [ "$TARGET_ARCH" = "arm" ]; then
+			SELECTED_DIGEST=$($JQ_BIN -r --arg variant "$TARGET_VARIANT" '
+			.manifests[]
+			| select(.platform.variant == $variant)
+			| .digest' "$TMP_MANIFEST")
+		else
+			SELECTED_DIGEST=$($JQ_BIN -r --arg arch "$TARGET_ARCH" '
+			.manifests[]
+			| select(.platform.architecture == $arch)
+			| .digest' "$TMP_MANIFEST")
+		fi
+
+		if [ -z "$SELECTED_DIGEST" ] || [ "$SELECTED_DIGEST" = "null" ]; then
+			rm -f "$TMP_MANIFEST"
+			error "Manifest list doesn't contain manifest for $TARGET_ARCH"
+		fi
+		#echo "Selected manifest digest: $SELECTED_DIGEST"
+		
+		http_get_auth "$REGISTRY_URL/v2/${REPO_FULL}/manifests/${SELECTED_DIGEST}" "$TMP_MANIFEST" "application/vnd.docker.distribution.manifest.v2+json"|| error "Не удалось загрузить манифест по digest $SELECTED_DIGEST"
+	#else
+		#echo "Got single scheme manifest, not manifest list."
+	fi
+
+	if $JQ_BIN -e '.errors' "$TMP_MANIFEST" >/dev/null 2>&1; then
+		ERR_MSG=$($JQ_BIN -r '.errors[0].message' "$TMP_MANIFEST")
+		rm -f "$TMP_MANIFEST"
+		error "Manifest returned error: $ERR_MSG"
+	fi
+
+	mv "$TMP_MANIFEST" "$MANIFEST_FILE"
+	echo "Manifest was saved at $MANIFEST_FILE"
+
+	mkdir -p "$GLOBAL_LAYERS_DIR" || error "Failed to create directory $GLOBAL_LAYERS_DIR"
+
+	LAYER_DIGESTS=$($JQ_BIN -r '.layers[].digest' "$MANIFEST_FILE")
+	if [ -z "$LAYER_DIGESTS" ]; then
+		error "Failed to extract a layer list from manifest $MANIFEST_FILE."
+	fi
+
+	echo "Found layers:"
+	INDEX=1
+	for DIGEST in $LAYER_DIGESTS; do
+		echo "    $INDEX	$DIGEST"
+		INDEX=$((INDEX+1))
+	done
+
+	CONFIG_DIGEST=$($JQ_BIN -r '.config.digest' "$MANIFEST_FILE")
+	if [ -z "$CONFIG_DIGEST" ] || [ "$CONFIG_DIGEST" = "null" ]; then
+		error "Failed to get image config from manifest $MANIFEST_FILE."
+	fi
+	echo "Found config blob with digest: $CONFIG_DIGEST"
+
+	CONFIG_FILE="$IMAGE_DIR/config.json"
+
+	http_get_auth "$REGISTRY_URL/v2/${REPO_FULL}/blobs/${CONFIG_DIGEST}" "$CONFIG_FILE" || error "Couldn't download config blob with digest $CONFIG_DIGEST"
+
+	#echo "Image config is saved at $CONFIG_FILE"
+
+	mkdir -p "$LAYERS_DIR" || error "Couldn't create directory $LAYERS_DIR"
+
+	INDEX=1
+	for DIGEST in $LAYER_DIGESTS; do
+		SHORT_DIGEST=$(echo "$DIGEST" | sed 's/sha256://')
+		GLOBAL_LAYER_PATH="$GLOBAL_LAYERS_DIR/$SHORT_DIGEST"
+		REL_GLOBAL_LAYER_PATH="$REL_GLOBAL_LAYERS_DIR/$SHORT_DIGEST"
+		TEMP_TAR_FILE="$GLOBAL_LAYER_PATH.tar.gz"
+		IMAGE_LAYER_LINK="$LAYERS_DIR/$INDEX"
+
+		# Если глобальная папка уже есть, пропускаем скачивание
+		if [ -d "$GLOBAL_LAYER_PATH" ]; then
+			echo "Layer $INDEX ($DIGEST) is already cached."
+		else
+			echo "Downloading layer $INDEX ($DIGEST)..."
+			BLOB_URL="$REGISTRY_URL/v2/${REPO_FULL}/blobs/${DIGEST}"
+			if ! http_get_auth "$BLOB_URL" "$TEMP_TAR_FILE"; then
+				error "Failed to download layer $INDEX ($DIGEST)."
+			fi
+
+			#echo "Extracting layer $INDEX ($DIGEST)..."
+			mkdir -p "$GLOBAL_LAYER_PATH" || error "Failed to create layer directory $GLOBAL_LAYER_PATH"
+			if ! tar -xzf "$TEMP_TAR_FILE" -C "$GLOBAL_LAYER_PATH"; then
+				error "Error when extracting layer $INDEX ($DIGEST)."
+			fi
+
+			rm "$TEMP_TAR_FILE"
+		fi
+
+		rm -rf "$IMAGE_LAYER_LINK" 2>/dev/null
+		ln -s "$REL_GLOBAL_LAYER_PATH" "$IMAGE_LAYER_LINK" || error "Failed to create symlink for layer $INDEX"
+
+		INDEX=$((INDEX + 1))
+	done
+
+	echo "Image $REPO_FULL:$TAG was downloaded successfully."
+	#echo "Global layers are in: $GLOBAL_LAYERS_DIR"
+	#echo "Layer symlinks are in: $LAYERS_DIR"
+}
+
+ensure_image_exists() {
+	parse_image_input "$1"
+	if [ ! -d "$IMAGES_DIR/$REPO_FULL/$TAG" ]; then
+		log "Image $IMAGES_DIR/$REPO_FULL/$TAG not found, pulling..."
+		nk_pull "$1" || {
+			log "Failed to pull image $1"
+			exit 1
+		}
+	fi
+}
+
+# delete layers that are not used by any images
+nk_layer_prune() {
+	set -e
+
+	USED_HASHES=$(find "$IMAGES_DIR" -type l -exec readlink -f {} \; | xargs -I{} basename {} | sort -u)
+
+	if [ -z "$USED_HASHES" ]; then
+		echo "Error: No used layers found!"
+		exit 1
+	fi
+
+	echo "Used layers:"
+	echo "$USED_HASHES" | sed 's/^/ - /'
+
+	echo "Starting pruning unused layers..."
+
+	for LAYER_PATH in "$GLOBAL_LAYERS_DIR"/*; do
+		[ -d "$LAYER_PATH" ] || continue
+		LAYER_HASH=$(basename "$LAYER_PATH")
+
+		if echo "$USED_HASHES" | grep -qx "$LAYER_HASH"; then
+			echo "Used layer: $LAYER_PATH"
+		else
+			echo "Deleting layer: $LAYER_PATH"
+			rm -rf "$LAYER_PATH"
+		fi
+	done
+
+	echo "Pruning is finished."
+}
+
+
+nk_stop() {
+	while [ "$1" != "" ]; do
+		container_prefix=$1
+		container_id=$(find_container "$container_prefix") || eval "shift; continue"
+		container_dir="$CONTAINERS_DIR/$container_id"
+		meta="$container_dir/metadata.json"
+
+		$JQ_BIN '.stopped = true' "$meta" > tmp && mv tmp "$meta"
+		pid=$($JQ_BIN -r .pid "$meta")
+
+		kill_wait_group $pid 5 2>/dev/null
+		if [ $? -eq 1 ]; then
+			kill -9 -$pid 2>/dev/null
+		fi
+		echo "$container_prefix"
+		shift
+	done
+}
+
+nk_kill() {
+	signal=""
+	while [ "$1" != "" ]; do
+		case "$1" in
+			--signal=*)
+				signal="${1#--signal=}"
+				shift
+				;;
+			-s)
+				shift
+				signal="$1"
+				shift
+				;;
+			*)
+				break
+				;;
+		esac
+	done
+
+	if [ -z "$signal" ]; then
+		signal="KILL"
+	fi
+
+	while [ "$1" != "" ]; do
+		container_prefix="$1"
+		container_id=$(find_container "$container_prefix") || { shift; continue; }
+		container_dir="$CONTAINERS_DIR/$container_id"
+		meta="$container_dir/metadata.json"
+
+		if [ ! -f "$meta" ]; then
+			printf "Error: cannot kill container: %s: metadata not found for container %s\n" "$container_prefix" "$container_id" >&2
+			shift
+			continue
+		fi
+
+		status=$($JQ_BIN -r .status "$meta")
+		pid=$($JQ_BIN -r .pid "$meta")
+
+		if [ "$status" != "running" ]; then
+			printf "Error: cannot kill container: %s: container %s is not running\n" "$container_prefix" "$container_id" >&2
+			shift
+			continue
+		fi
+
+		if kill -"$signal" -"$pid" 2>/dev/null; then
+			printf "%s\n" "$container_prefix"
+		else
+			printf "Error: cannot kill container: %s: failed to send signal %s\n" "$container_prefix" "$signal" >&2
+		fi
+
+		shift
+	done
+}
+
+
+nk_rm() {
+	force=0
+	remove_volumes=0
+	remove_link=0
+	while [ "$1" != "" ]; do
+		case "$1" in
+			--force)
+				force=1 ;;
+			--volumes)
+				remove_volumes=1 ;;
+			--link)
+				remove_link=1 ;;
+			--)
+				shift
+				break
+				;;
+			-*)
+				flags="${1#-}"
+				while [ -n "$flags" ]; do
+					flag="${flags%"${flags#?}"}"
+					flags="${flags#?}"
+					case "$flag" in
+						f) force=1 ;;
+						l) remove_link=1 ;;
+						v) remove_volumes=1 ;;
+						*)
+							echo "Error: Unknown option '-$flag'" >&2
+							exit 1
+							;;
+					esac
+				done
+				;;
+			*)
+				break ;;
+		esac
+		shift
+	done
+
+	if [ -z "$1" ]; then
+		 echo "Usage: $SCRIPT_NAME rm [options] <containers...>"
+		 exit 1
+	fi
+
+	while [ "$1" != "" ]; do
+		container_id=$(find_container "$1") || return $?
+		
+		container_dir="$CONTAINERS_DIR/$container_id"
+		meta="$container_dir/metadata.json"
+
+		status=$($JQ_BIN -r .status "$meta")
+		pid=$($JQ_BIN -r .pid "$meta")
+		restart_policy=$($JQ_BIN -r .restart_policy "$meta")
+		
+		if [ $force -eq 1 ]; then
+			$JQ_BIN '.stopped = true' "$meta" > tmp && mv tmp "$meta"
+			kill -9 -$pid 2>/dev/null
+			status="exited"
+		fi
+
+		if [ "$status" = "running" ]; then
+			echo "Error: Container $container_id is running" >&2
+			shift
+			continue
+		fi
+
+		cleanup_container "$container_dir"
+		rm -Rf "$container_dir"
+
+		# TODO: implement remove_link and remove_volumes
+
+		echo "$container_prefix"
+		shift
+	done
+}
+
+nk_prune() {
+	force=0
+	filter=""
+
+	while [ "$1" != "" ]; do
+		case "$1" in
+			--force|-f)
+				force=1
+				;;
+			--filter)
+				filter="$filter $1"
+				shift
+				;;
+			*)
+				break
+				;;
+		esac
+		shift
+	done
+
+	if [ -n "$filter" ]; then
+		printf "Ошибка: --filter не реализован\n" >&2
+		return 1
+	fi
+
+	if [ $force -eq 0 ]; then
+		echo WARNING! This will remove all stopped containers.
+		if ! prompt_confirmation "Are you sure you want to continue?"; then
+			return 1
+		fi
+	fi
+
+	total_kb=0
+	deleted_containers=""
+
+	tmpfile=$(mktemp)
+
+	find "$CONTAINERS_DIR/"* -maxdepth 1 -name metadata.json > "$tmpfile"
+
+	while IFS= read -r meta; do
+		#echo "Processing $meta"
+
+		status=$($JQ_BIN -r .status "$meta")
+		if [ "$status" = "exited" ]; then
+			container_dir=$(dirname "$meta")
+			container_id=$(basename "$container_dir")
+
+			if [ -d "$container_dir/work" ]; then
+				size_kb=$(du -sk "$container_dir/work" 2>/dev/null | awk '{print $1}')
+			elif [ -d "$container_dir/merged" ]; then
+				size_kb=$(du -sk "$container_dir/merged" 2>/dev/null | awk '{print $1}')
+			else
+				size_kb=0
+			fi
+
+			total_kb=$(( total_kb + size_kb ))
+			deleted_containers="$deleted_containers
+$container_id"
+
+			cleanup_container "$container_dir"
+			rm -rf "$container_dir"
+		fi
+	done < "$tmpfile"
+	rm -f "$tmpfile"
+
+	hr="0B"
+	if [ -n "$(echo "$deleted_containers" | sed '/^[[:space:]]*$/d')" ]; then
+		echo "Deleted Containers:"
+		echo "$deleted_containers" | sed '/^[[:space:]]*$/d'
+		
+		if [ "$total_kb" -lt 1024 ]; then
+			hr="${total_kb}kB"
+		else
+			hr="$(awk "BEGIN { printf \"%.2f\n\", $total_kb / 1024 }")MB"
+		fi
+		echo
+	fi
+	printf "Total reclaimed space: %s\n" "$hr"
+}
+
+nk_ps() {
+	SHOW_ALL="false"
+	only_ids=0
+	latest=0
+	display_sizes=0
+	no_trunc=0
+	FILTER_STATUS=""
+	LAST_COUNT=""
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--all) SHOW_ALL="true" ;;
+			--latest) latest=1 ;;
+			--quiet) only_ids=1 ;;
+			--size) display_sizes=1 ;;
+			--no-trunc) no_trunc=1 ;;
+			--filter|-f)
+				shift
+				if [ -z "$1" ]; then
+					printf "%s\n" "Error: --filter value is not set" >&2
+					exit 1
+				fi
+				case "$1" in
+					status=*) FILTER_STATUS="${1#status=}"  ;;
+					*) printf "%s\n" "Warning: Filter '$1' is not supported yet and will be ignored." >&2 ;;
+				esac
+				;;
+			-n|--last)
+				shift
+				if [ -z "$1" ]; then
+					printf "%s\n" "Error: -n/--last value is not set" >&2
+					exit 1
+				fi
+				LAST_COUNT="$1"
+				;;
+			-*)
+				flags=$(printf "%s" "$1" | sed 's/^-//')
+				while [ -n "$flags" ]; do
+					flag=${flags%"${flags#?}"}
+					flags=${flags#?}
+					case "$flag" in
+						a) SHOW_ALL="true" ;;
+						q) only_ids=1 ;;
+						l) latest=1 ;;
+						s) display_sizes=1 ;;
+						*)
+							printf "%s\n" "Error: Unknown option '-$flag'" >&2
+							exit 1
+							;;
+					esac
+				done
+				;;
+			*)
+				break
+				;;
+		esac
+		shift
+	done
+
+	if [ "$latest" -eq 1 ] && [ -z "$LAST_COUNT" ]; then
+		LAST_COUNT=1
+	fi
+
+	delim=$(printf '\t')
+
+	temp_file=$(mktemp)
+
+	find "$CONTAINERS_DIR/$prefix"* -maxdepth 1 -name metadata.json 2>/dev/null | while read -r meta; do
+		IFS="$delim"
+		read -r container_id image created status restart_policy stopped pid command exited_at exit_code ports <<EOF
+$($JQ_BIN -r '[.id, (.image | split(":")[0] | .[0:20]), .created, .status, (.restart_policy // "no"), (.stopped // 0), .pid, .command, .exited_at, (.exit_code // -1), (.ports // "none")] | join("'"$delim"'")' "$meta")
+EOF
+
+		created_ago=$(time_ago "$created")
+
+		if [ "$status" = "running" ]; then
+			if [ ! -d "/proc/$pid" ]; then
+				status="exited"
+				exited_at=$(date -u +"%Y-%m-%dT%H:%M:%S")
+				$JQ_BIN --arg exited "$exited_at" '.status = "exited" | .exited_at = $exited' "$meta" > tmp && mv tmp "$meta"
+			fi
+		fi
+
+		if [ "$SHOW_ALL" != "true" ] && [ "$status" != "running" ]; then
+			continue
+		fi
+
+		if [ -n "$FILTER_STATUS" ] && [ "$status" != "$FILTER_STATUS" ]; then
+			continue
+		fi
+
+		if [ "$status" = "exited" ]; then
+			exited_ago=$(time_ago "$exited_at")
+			if [ "$stopped" != "true" ] && [ "$restart_policy" != "no" ] && { [ "$restart_policy" != "on-failure" ] || [ "$exit_code" -ne 0 ]; }; then
+				status_str="Restarting ($exit_code) $exited_ago"
+			else
+				status_str="Exited ($exit_code) $exited_ago"
+			fi
+		else
+			status_str="Up $created_ago"
+		fi
+
+		if [ "$display_sizes" -eq 1 ]; then
+			container_dir=$(dirname "$meta")
+			if [ -d "$container_dir/work" ]; then
+				size=$(du -sh "$container_dir/work" 2>/dev/null | awk '{print $1}')
+			elif [ -d "$container_dir/merged" ]; then
+				size=$(du -sh "$container_dir/merged" 2>/dev/null | awk '{print $1}')
+			else
+				size="0"
+			fi
+		fi
+
+		if [ "$no_trunc" -eq 0 ]; then
+			display_container_id=$(printf "%s" "$container_id" | cut -c1-12)
+			cmd_len=$(printf "%s" "$command" | wc -c | tr -d ' ')
+			if [ "$cmd_len" -le 28 ]; then
+				display_command="$command"
+			else
+				display_command=$(printf "%s" "$command" | cut -c1-25)"..."
+			fi
+		else
+			display_container_id="$container_id"
+			display_command="$command"
+		fi
+
+		if [ "$ports" = "" ]; then
+			ports=" "
+		fi
+
+		# First field – created (for sorting), then the remaining fields.
+		line="$created${delim}$display_container_id${delim}$image${delim}$display_command${delim}$created_ago${delim}$status_str${delim}$ports"
+		if [ "$display_sizes" -eq 1 ]; then
+			line="$line${delim}$size"
+		fi
+		printf "%s\n" "$line" >> "$temp_file"
+	done
+
+	[ ! -s "$temp_file" ] && { rm -f "$temp_file"; return; }
+
+	sorted_file=$(mktemp)
+	sort -r -t "$delim" -k1,1 "$temp_file" > "$sorted_file"
+	rm "$temp_file"
+
+	if [ -n "$LAST_COUNT" ]; then
+		head -n "$LAST_COUNT" "$sorted_file" > "$sorted_file.tmp"
+		mv "$sorted_file.tmp" "$sorted_file"
+	fi
+
+	if [ "$only_ids" -eq 0 ]; then
+		if [ "$display_sizes" -eq 1 ]; then
+			printf "%-15s %-20s %-28s %-20s %-25s %-15s %-10s\n" "CONTAINER ID" "IMAGE" "COMMAND" "CREATED" "STATUS" "PORTS" "SIZE"
+		else
+			printf "%-15s %-20s %-28s %-20s %-25s %-15s\n" "CONTAINER ID" "IMAGE" "COMMAND" "CREATED" "STATUS" "PORTS"
+		fi
+	fi
+
+	while IFS="$delim" read -r sort_key cid image cmd created_ago status_str ports size; do
+		if [ "$only_ids" -eq 1 ]; then
+			printf "%s\n" "${cid:- }"
+		else
+			if [ "$display_sizes" -eq 1 ]; then
+				printf "%-15s %-20s %-28s %-20s %-25s %-15s %-10s\n" "${cid:- }" "${image:- }" "${cmd:- }" "${created_ago:- }" "${status_str:- }" "${ports:- }" "${size:- }"
+			else
+				printf "%-15s %-20s %-28s %-20s %-25s %-15s\n" "${cid:- }" "${image:- }" "${cmd:- }" "${created_ago:- }" "${status_str:- }" "${ports:- }"
+			fi
+		fi
+	done < "$sorted_file"
+	rm "$sorted_file"
+}
+
+run_impl() {
+	mount_image_layers "$image" "$container_dir"
+
+	#log "Starting container $container_id: $final_cmd"
+
+	run_container() {
+		CMD="run_in_container $(shell_quote "$container_id") \
+			$(shell_quote "$workdir") \
+			$(shell_quote "$env_vars") \
+			$(shell_quote "$user") \
+			$(shell_quote "$interactive") \
+			$(shell_quote "$tty_flag") \
+			$(shell_quote "$volumes") \
+			$(shell_quote "$ports") \
+			$(shell_quote "true") \
+			$(shell_quote "$final_cmd")"
+		if [ "$detach" = 1 ]; then
+			if [ "$tty_flag" = 1 ] && which tmux >/dev/null 2>&1; then
+				if which tee >/dev/null 2>&1; then
+					tmux new-session -d -s "$attach_session" sh -c ". \"$LIB_PATH\" --; $CMD 2>&1 | tee \"$log_file\""
+				else
+					tmux new-session -d -s "$attach_session" sh -c ". \"$LIB_PATH\" --; $CMD 2>&1"
+				fi
+				while tmux has-session -t "$attach_session" 2>/dev/null; do
+					sleep 1
+				done
+			else
+				eval "$CMD" >> "$log_file" 2>&1
+			fi
+		 else
+			eval "$CMD" #| tee -a "$log_file"
+			return $?
+		 fi
+	}
+
+	container_monitor() {
+		while true; do
+			if [ "$($JQ_BIN -r '.stopped // false' "$meta")" = "true" ]; then
+				log "Container $container_id has been manually stopped. Exiting monitor."
+				break
+			fi
+			run_container
+			rc=$?
+			if [ "$restart_policy" = "on-failure" ] && [ $rc -eq 0 ]; then
+				break
+			fi
+			if [ "$restart_policy" = "no" ]; then
+				break
+			fi
+			log "Container $container_id exited with code $rc, restarting in 1 second..." >> "$log_file" 2>&1
+			sleep 1
+		done
+		cleanup_container "$container_dir"
+		if [ $remove -eq 1 ]; then
+		   rm -Rf "$container_dir"
+		fi
+	}
+
+	if [ "$detach" != "" ]; then
+		#log before container_monitor \&, pid = $$
+		container_monitor &
+		monitor_pid=$!
+		#log "Container $container_id started in detached mode with restart policy '$restart_policy' (monitor pid: $monitor_pid)"
+		echo "$container_id"
+		exit 0
+	else
+		run_container
+		rc=$?
+
+		if [ "$restart_policy" != "no" ]; then
+			detach=1
+			log_verbose "Container $container_id exited with code $rc, starting monitor in background according to restart policy '$restart_policy'..."
+			container_monitor &
+			monitor_pid=$!
+			log_verbose "Monitor for container $container_id started (pid: $monitor_pid)"
+			echo "$container_id"
+			exit 0
+		else
+			cleanup_container "$container_dir"
+			if [ "$remove" = 1 ]; then
+				rm -Rf "$container_dir"
+			fi
+		fi
+	fi
+
+	return $rc
+}
+
+nk_run() {
+	interactive=0
+	tty_flag=0
+	remove=0
+	detach=""
+	restart_policy="no"
+	attach_session=""
+	volumes=""
+	ports=""
+	specified_env_vars=""
+	specified_workdir=""
+	specified_user=""
+	if [ -z "$container_id" ]; then
+		container_id="$(generate_container_id)"
+	fi
+	while [ "$1" != "" ]; do
+		case "$1" in
+			--detach)
+				detach=1 ;;
+			--rm)
+				remove=1 ;;
+			-P|--publish-all)
+				# TODO: for each exposed port map it to an auto selected free host port
+				;;
+			--restart* )
+				if echo "$1" | grep -q "="; then
+					restart_policy="${1#*=}"
+				else
+					shift
+					restart_policy="$1"
+				fi
+				;;
+			-v|--volume)
+				if [ -n "$2" ]; then
+					volumes="$volumes $2"
+					shift
+				else
+					log "Error: $1 requires an argument"
+					exit 1
+				fi
+				;;
+			--mount)
+				if [ -n "$2" ]; then
+					log "Warning: $1 is not implemented yet. Use -v instead."
+					shift
+				else
+					log "Error: $1 requires an argument"
+					exit 1
+				fi
+				;;
+			-p|--publish)
+				if [ -n "$2" ]; then
+					ports="$ports $2"
+					shift
+				else
+					log "Error: $1 requires an argument"
+					exit 1
+				fi
+				;;
+			-e|--env)
+				if [ -n "$2" ]; then
+					specified_env_vars="$specified_env_vars $2"
+					shift
+				else
+					log "Error: $1 requires an argument"
+					exit 1
+				fi
+				;;
+			--env-file)
+				if [ -n "$2" ]; then
+					while IFS= read -r line || [ -n "$line" ]; do
+						if [ -z "$line" ] || echo "$line" | grep -qE '^\s*#'; then
+							continue
+						fi
+						specified_env_vars="$specified_env_vars $line"
+					done < "$2"
+					shift
+				else
+					log "Error: $1 requires an argument"
+					exit 1
+				fi
+				;;
+			-u|--user)
+				if [ -n "$2" ]; then
+					specified_user="$2"
+					shift
+				else
+					log "Error: $1 requires an argument"
+					exit 1
+				fi
+				;;
+			-w|--workdir)
+				if [ -n "$2" ]; then
+					specified_workdir="$2"
+					shift
+				else
+					log "Error: $1 requires an argument"
+					exit 1
+				fi
+				;;
+			--)
+				shift
+				break
+				;;
+			-*)
+				flags="${1#-}"
+				while [ -n "$flags" ]; do
+					flag="${flags%"${flags#?}"}"
+					flags="${flags#?}"
+					case "$flag" in
+						i) interactive=1 ;;
+						t) tty_flag=1 ;;
+						d) detach=1 ;;
+						*)
+							log "Error: Unknown option '-$flag'"
+							exit 1
+							;;
+					esac
+				done
+				;;
+			*)
+				break
+				;;
+		esac
+		shift
+	done
+
+	if [ -z "$1" ]; then
+		 echo "Usage: $SCRIPT_NAME run [options] IMAGE [COMMAND]"
+		 exit 1
+	fi
+
+	image=$1
+	shift
+
+	ensure_image_exists "$image"
+
+	IFS='|' read -r env_vars workdir user final_cmd <<EOF
+$(parse_image_config "$image" "$*")
+EOF
+
+	container_dir="$CONTAINERS_DIR/$container_id"
+	mkdir -p "$container_dir"
+
+	log_file="$container_dir/container.log"
+	meta="$container_dir/metadata.json"
+
+	if [ "$detach" = 1 ] && [ "$tty_flag" = 1 ]; then
+		 attach_session="nk_$container_id"
+	fi
+
+	env_vars="$specified_env_vars $env_vars"
+	if [ -n "$specified_workdir" ]; then
+		workdir="$specified_workdir"
+	fi
+	if [ -n "$specified_user" ]; then
+		user="$specified_user"
+	fi
+
+	merged_dir="$container_dir/merged"
+	save_metadata "$container_dir" "$container_id" "$image" "$final_cmd" "$workdir" "$env_vars" "$user" "$restart_policy" "$attach_session" "$volumes" "$ports"
+	run_impl
+	return
+}
+
+nk_start() {
+	interactive=0
+
+	while [ "$1" != "" ]; do
+		case "$1" in
+			-i) interactive=1 ;;
+			--) shift; break ;;
+			-*)
+				echo "Unknown option: $1"
+				exit 1
+				;;
+			*) break ;;
+		esac
+		shift
+	done
+
+	if [ -z "$1" ]; then
+		echo "Usage: $SCRIPT_NAME start CONTAINER_ID"
+		exit 1
+	fi
+	container_prefix=$1
+	container_id=$(find_container "$container_prefix") || return $?
+
+	shift
+	while [ "$1" != "" ]; do
+		case "$1" in
+			-i) interactive=1 ;;
+			--) shift; break ;;
+			-*)
+				echo "Unknown option: $1"
+				exit 1
+				;;
+			*) break ;;
+		esac
+		shift
+	done
+
+	container_dir="$CONTAINERS_DIR/$container_id"
+	meta="$container_dir/metadata.json"
+	if [ ! -f "$meta" ]; then
+		log "Error: Container $container_id not found"
+		exit 1
+	fi
+
+	$JQ_BIN 'del(.stopped)' "$meta" > tmp && mv tmp "$meta"
+
+	IFS="$(printf '\t')"
+read -r image workdir env_vars status volumes ports command <<EOF
+$($JQ_BIN -r '[.image, .workdir, (.env | join(" ")), .status, (.volumes // ""), (.ports // ""), .command] | @tsv' "$meta")
+EOF
+	#log "read: image=$image workdir=$workdir env_vars=$env_vars status=$status volumes=$volumes ports=$ports command=$command"
+
+	mount_image_layers "$image" "$container_dir"
+	merged_dir="$container_dir/merged"
+
+
+	#log "Starting container $container_id: $command"
+	run_in_container "$container_id" "$workdir" "$env_vars" "" "$interactive" 0 "$volumes" "$ports" "true" "$command"
+
+	cleanup_container "$container_dir"
+}
+
+nk_restart() {
+	nk_stop "$@"
+	nk_start "$@"
+}
+
+nk_exec() {
+	interactive=0
+	tty_flag=0
+	detach=0
+
+	while [ "$1" != "" ]; do
+		case "$1" in
+			--detach) detach=1 ;;
+			--) shift; break ;;
+			-*)
+				flags="${1#-}"
+				while [ -n "$flags" ]; do
+					flag="${flags%"${flags#?}"}"
+					flags="${flags#?}"
+					case "$flag" in
+						i) interactive=1 ;;
+						t) tty_flag=1 ;;
+						d) detach=1 ;;
+						*)
+							echo "Error: Unknown option '-$flag'" >&2
+							exit 1
+							;;
+					esac
+				done
+				;;
+			*) break ;;
+		esac
+		shift
+	done
+
+	if [ $# -lt 1 ]; then
+		echo "Usage: $SCRIPT_NAME exec [options] <container_id_prefix> COMMAND [ARGS...]"
+		exit 1
+	fi
+
+	container_prefix=$1
+	container_id=$(find_container "$container_prefix") || return $?
+	shift
+	cmd="$*"
+
+	container_dir="$CONTAINERS_DIR/$container_id"
+	meta="$container_dir/metadata.json"
+	if [ ! -f "$meta" ]; then
+		log "Error: Container $container_id not found"
+		exit 1
+	fi
+
+	IFS="$(printf '\t')"
+read -r workdir env_vars status volumes ports <<EOF
+$($JQ_BIN -r '[.workdir, (.env | join(" ")), .status, (.volumes // ""), (.ports // "")] | @tsv' "$meta")
+EOF
+
+	if [ "$status" != "running" ]; then
+		log "Error: Container $container_id is not running (status: $status)"
+		exit 1
+	fi
+
+	#log "Executing in container $container_id: $cmd"
+	run_in_container "$container_id" "$workdir" "$env_vars" "$interactive" "$tty_flag" "$volumes" "$ports" "false" "$cmd"
+}
+
+nk_attach() {
+	if [ $# -lt 1 ]; then
+		echo "Usage: $SCRIPT_NAME attach CONTAINER_ID"
+		exit 1
+	fi
+
+	container_prefix=$1
+	container_id=$(find_container "$container_prefix") || return $?
+	container_dir="$CONTAINERS_DIR/$container_id"
+	meta="$container_dir/metadata.json"
+
+	if [ ! -f "$meta" ]; then
+		echo "Error: Container $container_id not found"
+		exit 1
+	fi
+
+	attach_session=$($JQ_BIN -r '.attach_session // empty' "$meta")
+	if [ -z "$attach_session" ]; then
+		echo "Error: Container $container_id does not support attach (attach_session not set)."
+		exit 1
+	fi
+
+	if ! command -v tmux >/dev/null 2>&1; then
+		echo "Error: tmux is required for attach but not found."
+		exit 1
+	fi
+
+	tmux attach-session -t "$attach_session"
+}
+
+nk_logs() {
+	follow=false
+	tail_lines="all"
+	container_id=""
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-f|--follow)
+				follow=true
+				shift
+				;;
+			-n|--tail)
+				if [ $# -lt 2 ]; then
+					echo "Error: $1 requires an argument" >&2
+					exit 1
+				fi
+				tail_lines="$2"
+				shift 2
+				;;
+			--since|--until)
+				echo "Warning: $1 is not supported" >&2
+				if [ $# -lt 2 ]; then
+					echo "Error: $1 requires an argument" >&2
+					exit 1
+				fi
+				shift 2
+				;;
+			--details|-t|--timestamps)
+				echo "Warning: $1 is not supported" >&2
+				shift
+				;;
+			-*)
+				echo "Error: Unknown option $1" >&2
+				exit 1
+				;;
+			*)
+				if [ -z "$container_id" ]; then
+					container_id="$1"
+					shift
+				else
+					echo "Error: Multiple container IDs specified: $container_id and $1" >&2
+					exit 1
+				fi
+				;;
+		esac
+	done
+
+	if [ -z "$container_id" ]; then
+		echo "Usage: $SCRIPT_NAME logs [OPTIONS] CONTAINER_ID" >&2
+		exit 1
+	fi
+
+	if [ "$tail_lines" != "all" ]; then
+		case $tail_lines in
+			''|*[!0-9]*)
+				echo "Error: --tail requires a numeric argument or 'all'" >&2
+				exit 1
+				;;
+		esac
+	fi
+
+	container_id=$(find_container "$container_id") || exit $?
+	container_dir="$CONTAINERS_DIR/$container_id"
+	log_file="$container_dir/container.log"
+
+	if [ ! -f "$log_file" ]; then
+		echo "No log file for container $container_id." >&2
+		exit 1
+	fi
+
+	if [ "$follow" = true ]; then
+		if [ "$tail_lines" = "all" ]; then
+			cmd="tail -n +1 -f"
+		else
+			cmd="tail -n $tail_lines -f"
+		fi
+	else
+		if [ "$tail_lines" = "all" ]; then
+			cmd="cat"
+		else
+			cmd="tail -n $tail_lines"
+		fi
+	fi
+
+	$cmd "$log_file"
+}
+
+nk_inspect() {
+	if [ $# -lt 1 ]; then
+		echo "Usage: $SCRIPT_NAME inspect CONTAINER_ID"
+		exit 1
+	fi
+
+	container_prefix=$1
+	container_id=$(find_container "$container_prefix") || return $?
+	container_dir="$CONTAINERS_DIR/$container_id"
+	meta="$container_dir/metadata.json"
+
+	if [ ! -f "$meta" ]; then
+		echo "Not found."
+		exit 1
+	fi
+
+	cat "$meta"
+}
+
+extract_upper_from_merged() {
+	lower_dirs="$1"
+	merged_dir_path="$2"
+	upper_path="$3"
+
+	#rsync -a --compare-dest="$lower_dir" "$new_dir"/ "$upper_path"/
+
+	cd "$merged_dir" || exit 1
+
+	IFS=' '
+
+	find . -type f | while read -r file; do
+		# Инициализируем переменную для отслеживания наличия файла в lower_dirs
+		found_in_lower=0
+		
+		IFS=":"
+		set -- $lower_dirs
+		IFS=' '
+		for lower_dir; do
+			if [ -f "$lower_dir/$file" ]; then
+				found_in_lower=1
+				sum_new=$(md5sum "$file" | awk '{print $1}')
+				sum_old=$(md5sum "$lower_dir/$file" | awk '{print $1}')
+				if [ "$sum_new" != "$sum_old" ]; then
+					mkdir -p "$(dirname "$upper_path/$file")"
+					log_verbose extract 1: cp -p "$file" "$upper_path/$file"
+					cp -p "$file" "$upper_path/$file"
+				fi
+				# Если файл совпадает, прерываем цикл
+				break
+			fi
+		done
+		
+		# If not found in any of lower_dirs, copy it
+		if [ "$found_in_lower" -eq 0 ]; then
+			mkdir -p "$(dirname "$upper_path/$file")"
+			#log extract 2: cp -p "$file" "$upper_path/$file"
+			cp -p "$file" "$upper_path/$file"
+		fi
+	done
+
+	# Create AUFS whiteout files for deleted files
+	# TODO: for overlayfs compatibility create character devices instead
+	IFS=":"
+	set -- $lower_dirs
+	IFS=' '
+	for lower_dir; do
+		log find "$lower_dir" -type f
+		find "$lower_dir" -type f | while read -r lower_file; do
+			# Преобразуем путь к файлу в lower_dir, чтобы он соответствовал структуре new_dir
+			relative_path="${lower_file#"$workdir_path"/}"
+			if [ ! -f "$merged_dir_path/$relative_path" ]; then
+				# Создаём whiteout-файл в workdir_path
+				mkdir -p "$(dirname "$workdir_path/$relative_path")"
+				touch "$workdir_path/$relative_path.wh..wh..opq"
+			fi
+		done
+	done
+
+	cd -
+}
+
+image_last_layer_index() {
+	image_dir="$1"
+	#find "$image_dir/layers" -mindepth 1 -maxdepth 1 -type d -follow -exec basename {} \; | sort -n | tail -n 1
+	max=0
+	for path in "$image_dir/layers"/*; do
+	[ -d "$path" ] || continue
+	name=${path##*/}
+	case $name in
+		(''|*[!0-9]*) continue ;;  # пропустить, если не число
+	esac
+	[ "$name" -gt "$max" ] && max=$name
+	done
+	echo "$max"
+}
+
+calc_next_layer_hash() {
+	last_layer_hash="$1"
+	new_layer_info_for_hash="$2"
+	layer_hash=$(echo "$last_layer_hash $new_layer_info_for_hash" | sha256sum | awk '{print $1}')
+}
+
+get_image_last_layer_hash() {
+	image_dir="$1"
+
+	last_layer_hash=""
+	layer_index=$(image_last_layer_index "$image_dir")
+	if [ -n "$layer_index" ]; then
+		last_layer_hash=$(basename "$(readlink "$image_dir/layers/$layer_index")")
+	fi
+}
+
+calc_new_image_layer_hash() {
+	image_dir="$1"
+	new_layer_info_for_hash="$2"
+	get_image_last_layer_hash "$image_dir"
+	calc_next_layer_hash "$last_layer_hash" "$new_layer_info_for_hash"
+}
+
+# Basic primitive to implement commit and build: turn writable container layer into a new image layer
+commit_layer() {
+	container_id="$1"
+	new_layer_hash="$2" # any string as an identifier to generate new layer's hash
+	dst_image="$3" # it's expected to exist and be equivalent to or the same as base container's image
+
+	container_dir="$CONTAINERS_DIR/$container_id"
+	merged_dir="$container_dir/merged"
+	if [ -z "$dst_image" ]; then
+		dst_image=$($JQ_BIN -r '.image' "$container_dir/metadata.json")
+	fi
+
+	parse_image_input "$dst_image"
+	
+	dst_image_dir="$IMAGES_DIR/$REPO_FULL/$TAG"
+
+	layer_index=$(image_last_layer_index "$dst_image_dir")
+	layer_index=$(( ${layer_index:-0} + 1 ))
+	new_layer_dir="$GLOBAL_LAYERS_DIR/$new_layer_hash"
+
+	if [ -d "$new_layer_dir" ]; then
+		rm -R "$new_layer_dir"
+	fi
+	mkdir -p "$new_layer_dir"
+
+	if [ "$USE_OVERLAYFS" -eq 1 ]; then
+		log_verbose "1: $merged_dir"
+		umount -lf "$merged_dir"
+		#ls "$container_dir/upper/"
+		log_verbose mv "$container_dir/upper/"* "$new_layer_dir/"
+		mv "$container_dir/upper"/* "$new_layer_dir/"
+		#ls "$new_layer_dir/"
+		mount_image_dir_layers_overlay "$container_dir" "$dst_image_dir/layers"
+	else
+		set_lower_dirs_for_image "$dst_image_dir/layers"
+		log extract_upper_from_merged "$lower_dirs" "$container_dir/merged" "$new_layer_dir"
+		extract_upper_from_merged "$lower_dirs" "$container_dir/merged" "$new_layer_dir"
+	fi
+	log_verbose ln -sf "$REL_GLOBAL_LAYERS_DIR/$new_layer_hash" "$dst_image_dir/layers/$layer_index"
+	ln -sf "$REL_GLOBAL_LAYERS_DIR/$new_layer_hash" "$dst_image_dir/layers/$layer_index"
+}
+
+nk_commit() {
+	container_id="$1"
+	new_image_name="$2"
+
+	parse_image_input "$new_image_name"
+	dst_image_dir="$IMAGES_DIR/$REPO_FULL/$TAG"
+
+	base_image=$($JQ_BIN -r '.image' "$dst_image_dir/config.json")
+	parse_image_input "$base_image"
+	base_image_dir="$IMAGES_DIR/$REPO_FULL/$TAG"
+
+	cp -R "$base_image_dir" "$dst_image_dir"
+
+	new_layer_hash="$(echo "$new_image_name $(date +%s)" | sha256sum | awk '{print $1}')"
+	commit_layer "$container_id" "$new_layer_hash" "$new_image_name"
+}
+
+parse_user_uid() {
+	user="$1"
+	passwd_path="$2"
+
+	case "$user" in
+		''|*[!0-9]*) 
+			if echo "$user" | grep -q ":"; then
+				username=$(echo "$user" | cut -d: -f1)
+				uid=$(grep "^$username:" "$passwd_path" | cut -d: -f3)
+			else
+				uid=$(grep "^$user:" "$passwd_path" | cut -d: -f3)
+			fi
+			
+			if [ -z "$uid" ]; then
+				log "Error: user '$user' not found"
+				return 1
+			fi
+			;;
+		*) 
+			uid=$user
+			;;
+	esac
+
+	echo "$uid"
+	return 0
+}
+
+read_continued_line() {
+    input_file="$1"
+    line_var="$2"
+    buffer=""
+    line=""
+    continue_reading=true
+    
+    eval "$line_var=''"
+    while IFS= read -r line && [ "$continue_reading" = true ]; do
+        line=$(echo "$line" | tr -d '\r')
+        if [ "${line%\\}" != "$line" ]; then
+            buffer="$buffer${line%\\}"
+        else
+            line="$buffer$line"
+            buffer=""
+            eval "$line_var=\$line"
+            continue_reading=false
+        fi
+    done < "$input_file"
+    
+    if [ -n "$(eval echo \$$line_var)" ] || [ -n "$buffer" ]; then
+        if [ -n "$buffer" ]; then
+            eval "$line_var=\$buffer"
+        fi
+        return 0
+    else
+        return 1
+    fi
+}
+
+join_root_path() {
+  root_dir="$1"
+  rel_path="$2"
+  
+  case "$root_dir" in
+    /*) ;;
+    *) root_dir="$(pwd)/$root_dir" ;;
+  esac
+  
+  case "$rel_path" in
+    /*) rel_path="${rel_path#/}" ;;
+  esac
+  
+  full_path="${root_dir}/${rel_path}"
+  
+  normalized_path=""
+  IFS="/"
+  for component in ${full_path}; do
+    case "$component" in
+      ""|".") continue ;;
+      "..") 
+        normalized_path="${normalized_path%/*}"
+        if [ "${normalized_path#"$root_dir"}" = "$normalized_path" ]; then
+          log "Error: path attempts to go outside root directory" >&2
+          return 1
+        fi
+        ;;
+      *) normalized_path="${normalized_path}/${component}" ;;
+    esac
+  done
+  
+  if [ -z "$normalized_path" ]; then
+    normalized_path="$root_dir"
+  fi
+  
+  echo "$normalized_path"
+}
+
+join_paths() {
+  dir="$1"
+  path="$2"
+  
+  case "$path" in
+    /*) echo "$path" && return 0 ;;
+  esac
+  
+  echo "${dir}/${path}"
+}
+
+nk_build() {
+	new_image_name=$(generate_image_id)
+	while [ "$1" != "" ]; do
+		case "$1" in
+			-t|--tag)
+				if [ -n "$2" ]; then
+					new_image_name=$2
+					shift
+				else
+					echo "Error: $1 requires an argument" >&2
+					exit 1
+				fi
+				;;
+			-f|--file)
+				if [ -n "$2" ]; then
+					dockerfile="$2"
+					shift
+				else
+					echo "Error: $1 requires an argument" >&2
+					exit 1
+				fi
+				;;
+			--no-cache)
+					nocache=1
+				;;
+			*)
+				break
+				;;
+		esac
+		shift
+	done
+	if [ -z "$dockerfile" ]; then
+		dockerfile=$1/Dockerfile
+	fi
+
+	if [ -z "$1" ]; then
+		 echo "Usage: $SCRIPT_NAME build PATH"
+		 exit 1
+	fi
+
+	parse_image_input "$new_image_name"
+	new_image_dir="$IMAGES_DIR/$REPO_FULL/$TAG"
+	image_layers_dir="$new_image_dir/layers"
+
+	layer_index=1
+
+	config_workdir="/"
+	config_cmd=""
+	config_entrypoint=""
+	config_env=""
+	config_user=0
+	config_expose=""
+	volumes=""
+	ports=""
+	set_env_vars=""
+	env_vars=""
+	arg_vars=""
+	
+	last_layer_hash=""
+	temp_container_id="_$(generate_container_id)"
+	container_id="$temp_container_id"
+	container_dir="$CONTAINERS_DIR/$container_id"
+	log_file="$container_dir/container.log"
+	meta="$container_dir/metadata.json"
+
+	rm -R "$new_image_dir"
+	log_verbose "new_image_dir: $new_image_dir"
+	log_verbose "container_dir: $container_dir"
+
+	save_temp_container_metadata() {
+		save_metadata "$container_dir" "$container_id" "$new_image_name" "$final_cmd" "$config_workdir" "$env_vars" "$config_user" "no" "empty" "$volumes" "$ports"
+	}
+
+	set -e
+
+	while read -r line; do
+		line=$(echo "$line" | tr -d '\r')
+		log_verbose "$line"
+		case "$line" in
+			FROM\ *)
+				base_image=$(echo "$line" | awk '{print $2}')
+				log_verbose "base_image=\"$base_image\""
+				ensure_image_exists "$base_image"
+				base_image_dir="$IMAGES_DIR/$REPO_FULL/$TAG"
+				if [ ! -d "$base_image_dir" ]; then
+					exit 1
+				fi
+				mkdir -p "$image_layers_dir"
+				cp -a "$base_image_dir/layers"/. "$image_layers_dir"/
+				get_image_last_layer_hash "$new_image_dir"
+				log_verbose "layer_index=$layer_index"
+
+				IFS='|' read -r set_env_vars workdir user final_cmd <<EOF
+$(parse_image_config "$base_image" "$*")
+EOF
+
+				#parse_image_config "$base_image" # sets vars defined above
+				save_temp_container_metadata
+				;;
+			RUN\ *)
+				runcmd=$(echo "$line" | cut -d' ' -f2-)
+				calc_next_layer_hash "$last_layer_hash" "$config_workdir $config_user $set_env_vars $arg_vars $runcmd"
+
+				if [ "$nocache" != 1 ]; then
+					if [ -e "$GLOBAL_LAYERS_DIR/$layer_hash" ]; then
+						layer_index=$((layer_index + 1))
+						log_verbose ln -sf "$REL_GLOBAL_LAYERS_DIR/$layer_hash" "$image_layers_dir/$layer_index"
+						ln -sf "$REL_GLOBAL_LAYERS_DIR/$layer_hash" "$image_layers_dir/$layer_index"
+						continue
+					fi
+				fi
+
+				final_cmd="/bin/sh -c \"$runcmd\""
+				#final_cmd="$runcmd" # use in case /bin/sh doesn't exist?
+
+				log_verbose "env_vars: $set_env_vars $arg_vars"
+				image="$new_image_name" env_vars="$set_env_vars $arg_vars" run_impl
+				
+				commit_layer "$container_id" "$layer_hash" "$new_image_name"
+				;;
+			COPY\ *|ADD\ *)
+				cmd_args=$(echo "$line" | sed 's/^[^ ]* //')
+				if echo "$cmd_args" | grep -q '^\[.*\]'; then
+					args=$(echo "$cmd_args" | sed 's/^\[\(.*\)\]$/\1/' | sed 's/","/\n/g' | sed 's/"//g')
+					dest=$(echo "$args" | tail -n 1)
+					src=$(echo "$args" | head -n -1 | tr '\n' ' ')
+				else
+					dest=$(echo "$cmd_args" | awk '{print $NF}')
+					src=$(echo "$cmd_args" | awk '{for(i=1;i<NF;i++) printf "%s ", $i}')
+				fi
+				src=$(echo "$src" | sed 's/ *$//')
+				dest=$(echo "$dest" | sed 's/ *$//')
+
+				# TODO: support --chown=user:group
+
+				calc_next_layer_hash "$last_layer_hash" "$config_workdir $config_user $env_vars $arg_vars $line"
+
+				if [ "$nocache" != 1 ]; then
+					if [ -e "$GLOBAL_LAYERS_DIR/$layer_hash" ]; then
+						layer_index=$((layer_index + 1))
+						#log ln -sf "$REL_GLOBAL_LAYERS_DIR/$layer_hash" "$image_layers_dir/$layer_index"
+						ln -sf "$REL_GLOBAL_LAYERS_DIR/$layer_hash" "$image_layers_dir/$layer_index"
+						continue
+					fi
+				fi
+				mount_image_dir_layers "$container_dir" "$image_layers_dir"/
+
+				# TODO if ADD, may unpack archive or download file
+				dst_path_in_container=$(join_root_path "$container_dir/merged/" "$(join_paths "$config_workdir" "$dest")")
+
+				#cp -a "$src" "$dst_path_in_container"
+				set -- $src
+				for resolved_item do
+					case "$resolved_item" in
+						http://*|https://*)
+							filename=$(basename "$resolved_item")
+							log_verbose http_get "$resolved_item" "$dst_path_in_container/$filename"
+							http_get "$resolved_item" "$dst_path_in_container/$filename"
+							;;
+						*)
+							log_verbose cp -a "$resolved_item" "$dst_path_in_container"
+							cp -a "$resolved_item" "$dst_path_in_container"
+							;;
+					esac
+				done
+				
+				save_temp_container_metadata
+				commit_layer "$container_id" "$layer_hash" "$new_image_name"
+				;;
+			WORKDIR\ *)
+				config_workdir=$(echo "$line" | cut -d' ' -f2-)
+				;;
+			USER\ *)
+				user=$(echo "$line" | cut -d' ' -f2-)
+				mount_image_dir_layers "$container_dir" "$image_layers_dir"/
+				parse_user_uid "$user" "$container_dir/merged/etc/passwd" > /dev/null
+				config_user=$uid
+				;;
+			ENV\ *)
+				env=$(echo "$line" | cut -d' ' -f2-)
+				set_env_vars="$set_env_vars $env"
+				;;
+			ARG\ *)
+				arg=$(echo "$line" | cut -d' ' -f2-)
+				arg_vars="$arg_vars $arg"
+				;;
+			ENTRYPOINT\ *)
+				entrypoint=$(echo "$line" | cut -d' ' -f2-)
+				config_entrypoint="$entrypoint"
+				;;
+			CMD\ *)
+				cmd=$(echo "$line" | cut -d' ' -f2-)
+				config_cmd="$cmd"
+				;;
+			EXPOSE\ *)
+				expose=$(echo "$line" | cut -d' ' -f2-)
+				config_expose="$config_expose $expose"
+				;;
+			LABEL\ *)
+				label=$(echo "$line" | cut -d' ' -f2-)
+				;;
+			MAINTAINER\ *)
+				maintainer=$(echo "$line" | cut -d' ' -f2-)
+				;;
+			*)
+				# Пропускаем комментарии и пустые строки
+				;;
+		esac
+	done < "$dockerfile"
+
+	# TODO: update image config
+	env_vars="$set_env_vars" save_image_config "$new_image_dir/config.json"
+	log_verbose cleanup
+	cleanup_container "$container_dir"
+	log_verbose rm -Rf "$container_dir"
+	rm -Rf "$container_dir" > /dev/null 2>&1
+	log "Image built: $new_image_name"
+}
+
+SCRIPT_NAME=$(basename "$0")
 case "$1" in
     pull)
         shift
-        nk-pull "$@"
+        nk_pull "$@"
         ;;
-    run|start|exec|stop|restart|attach|logs|inspect|ps|rm|kill)
+    run|start|exec|stop|restart|attach|logs|inspect|ps|rm|kill|build)
         cmd="nk_$1"
         shift
         $cmd "$@"
@@ -60,8 +2292,9 @@ case "$1" in
                 ;;
         esac
         ;;
+    --) ;;
     *)
-        echo "Usage: $SCRIPT_NAME {pull|run|start|exec|ps|stop|restart|attach|logs|inspect} ..."
+        echo "Usage: $SCRIPT_NAME {pull|run|start|exec|stop|restart|attach|logs|inspect|ps|rm|kill|build} ..."
         echo "       $SCRIPT_NAME container {run|start|exec|stop|restart|attach|logs|inspect|ls|list|ps|prune} ..."
         echo "       $SCRIPT_NAME image pull ..."
         exit 1
