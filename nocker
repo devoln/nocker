@@ -3,7 +3,7 @@
 REGISTRY_URL=${REGISTRY_URL:-https://registry-1.docker.io}
 
 if [ -n "$NOCKER_ROOT" ]; then
-	NOCKER_ROOT="$NOCKER_ROOT"
+	true
 elif [ "$(id -u)" -eq 0 ]; then
 	NOCKER_ROOT="/var/lib/nocker"
 else
@@ -17,13 +17,34 @@ REL_GLOBAL_LAYERS_DIR="../../../../../global_layers"
 
 LOG_FILE="$NOCKER_ROOT/nocker.log"
 
+TMPDIR=${TMPDIR:-/tmp}
+export PROOT_TMP_DIR="${PROOT_TMP_DIR:-$TMPDIR}"
 IMAGES_DIR="$NOCKER_ROOT/images"
 CONTAINERS_DIR="$NOCKER_ROOT/containers"
+NETWORKS_DIR="$NOCKER_ROOT/networks"
 
-PROOT_BIN=${PROOT_BIN:-proot}
-JQ_BIN=${JQ_BIN:-jq}
+if [ -n "$PROOT_BIN" ]; then
+	true
+else
+	PROOT_BIN=$(which proot)
+	if [ "$PROOT_BIN" = "/data/data/com.termux/files/usr/bin/proot" ]; then
+		PROOT_BIN="$PROOT_BIN --sysvipc --ashmem-memfd"
+	fi
+fi
 
-mkdir -p "$IMAGES_DIR" "$CONTAINERS_DIR"
+JQ_BIN=${JQ_BIN:-$(which jq)}
+
+if [ ! -d "$NOCKER_ROOT" ]; then
+	mkdir -p "$IMAGES_DIR" "$CONTAINERS_DIR" "$NETWORKS_DIR"
+	USE_CHROOT=$( [ "$(id -u)" -eq 0 ] && echo 1 || echo 0 )
+	USE_OVERLAYFS=$( [ "$(id -u)" -eq 0 ] && (grep -q overlay /proc/filesystems || modprobe overlay 2> /dev/null) && echo 1 || echo 0 )
+	echo "USE_CHROOT=$USE_CHROOT
+USE_OVERLAYFS=$USE_OVERLAYFS
+	" > "$NOCKER_ROOT/config.conf" # TODO: detect supported features
+	echo "{}" > "$NETWORKS_DIR/default.json"
+	echo "{}" > "$NETWORKS_DIR/host.json"
+	echo "{}" > "$NETWORKS_DIR/none.json"
+fi
 
 USE_OVERLAYFS=$( [ "$(id -u)" -eq 0 ] && (grep -q overlay /proc/filesystems || modprobe overlay 2> /dev/null) && echo 1 || echo 0 )
 #echo Use overlay: "$USE_OVERLAYFS"
@@ -368,9 +389,14 @@ mount_image_dir_layers() {
 
 	mkdir -p "$container_dir/merged/etc"
 	for file in resolv.conf host.conf hosts nsswitch.conf; do
-		cp "/etc/$file" "$container_dir/merged/etc/" > /dev/null 2>&1
+		cp "/etc/$file" "$container_dir/merged/etc/" > /dev/null 2>&1 || true
 	done
-	cp /run/systemd/resolve/resolv.conf "$container_dir/merged/etc/" > /dev/null 2>&1
+	cp /run/systemd/resolve/resolv.conf "$container_dir/merged/etc/" > /dev/null 2>&1 || true
+	log_verbose "done cp /run/systemd/resolve/resolv.conf"
+	if [ ! -s "$container_dir/merged/etc/resolv.conf" ]; then
+		echo "nameserver 1.0.0.1
+nameserver 8.8.8.8" > "$container_dir/merged/etc/resolv.conf"
+	fi
 }
 
 mount_image_layers() {
@@ -392,6 +418,78 @@ generate_container_id() {
 
 generate_image_id() {
 	generate_id "image_"
+}
+
+
+alloc_ip() {
+	network="$1"
+	network_dir="$NETWORKS_DIR/$network"
+
+	if [ ! -d "$network_dir" ]; then
+		return 1
+	fi
+
+	alloc_file="$network_dir/alloc"
+	subnet="10.17.0" # TODO: put into network's config file
+
+	suffix=100 # leave 2-99 for manually set IPs
+	if [ ! -f "$alloc_file" ]; then
+		echo "$suffix" > "$alloc_file"
+	else
+		suffix=$(cat "$alloc_file")
+	fi
+	echo "$((suffix + 1))" > "$alloc_file"
+
+	echo "$subnet.$suffix"
+}
+
+net_setup() {
+	net="$1"
+    config_file="$NETWORKS_DIR/$net.json"
+    [ -f "$config_file" ] || return 1
+
+    type=$(sed -n 's/.*"type"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$config_file")
+    subnet=$(sed -n 's/.*"subnet"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$config_file")
+
+    # Пропускаем сети типа 'host' и 'none'
+    [ "$type" = "host" ] && return 1
+    [ "$type" = "none" ] && return 1
+
+    # Имя интерфейсов
+    veth_host="veth-${container_id}-${net}"
+    veth_cont="eth-${net}"
+
+    # Создаём мост, если он ещё не создан
+    if ! ip link show "$net" >/dev/null 2>&1; then
+        ip link add name "$net" type bridge
+        ip link set "$net" up
+        # Можно настроить IP моста из subnet (например, .1)
+        bridge_ip=$(echo "$subnet" | sed 's|0/.*|1|')
+        ip addr add "$bridge_ip/24" dev "$net" 2>/dev/null
+    fi
+
+    # Создаём veth-пару
+    ip link add "$veth_host" type veth peer name "$veth_cont"
+
+    # Присоединяем один конец к мосту
+    ip link set "$veth_host" master "$net"
+    ip link set "$veth_host" up
+
+    # Эту секцию выполнять после запуска контейнера, когда узнаем его main_pid
+    ip link set "$veth_cont" netns "$main_pid"
+	nsenter --net=/proc/"$main_pid"/ns/net ip addr add "$container_ip/16" dev "$veth_cont"
+	nsenter --net=/proc/"$main_pid"/ns/net ip link set "$veth_cont" up
+	nsenter --net=/proc/"$main_pid"/ns/net ip link set lo up
+	nsenter --net=/proc/"$main_pid"/ns/net ip route add default via 192.168.100.1
+
+    # Генерация команды, которую должен выполнить контейнер
+    ip_in_net=$(echo "$subnet" | sed 's|0/.*|'"$(( (RANDOM % 200) + 2 ))"'|')
+    CMD="$CMD
+ip link set $veth_cont name eth0
+ip link set eth0 up
+ip addr add $ip_in_net/24 dev eth0
+ip route add default via $(echo "$subnet" | sed 's|0/.*|1|')
+"
 }
 
 save_metadata() {
@@ -441,20 +539,25 @@ run_in_container() {
 	volumes=$7
 	ports=$8
 	is_main_process=$9
-	shift 9
+	networks=${10}
+	shift 10
 	merged_dir="$CONTAINERS_DIR/$container_id/merged"
 	command="$*"
 
-	mkdir -p /tmp/nocker_$container_id
-	mkdir -p /run/shm/nocker_$container_id 2>/dev/null
-	if [ -n "$?" ]; then
-		mkdir -p /dev/shm/nocker_$container_id
-		SHM_DIR=/dev/shm
-	else
+	if [ -d /run/shm ]; then
 		SHM_DIR=/run/shm
+		mkdir -p "$SHM_DIR/nocker_$container_id" 2>/dev/null
+		if [ -n "$?" ]; then
+			SHM_DIR=/dev/shm
+			mkdir -p "$SHM_DIR/nocker_$container_id"
+		fi
+	else
+		SHM_DIR=$TMPDIR
+		mkdir -p "$SHM_DIR/nocker_$container_id"
 	fi
 
 	log_verbose "run_in_container: env_vars (before): $set_env_vars $arg_vars"
+
 
 	(
 		if [ "$(id -u)" -eq 0 ]; then
@@ -502,7 +605,7 @@ run_in_container() {
 			fi
 			need_umount=1
 		else
-			proot_cmd="$PROOT_BIN -i $user:$user -r \"$merged_dir\" -b /tmp/nocker_$container_id:/tmp -b $SHM_DIR/nocker_$container_id:/run/shm -b /proc -b /sys -b /dev --kill-on-exit -w \"${workdir:-/}\""
+			proot_cmd="$PROOT_BIN --link2symlink -i $user:$user -r \"$merged_dir\" -b $SHM_DIR/nocker_$container_id:/run/shm -b /proc -b /sys -b /dev --kill-on-exit -w \"${workdir:-/}\""
 			for vol in $volumes; do
 				proot_cmd="$proot_cmd -b $vol"
 			done
@@ -529,7 +632,29 @@ run_in_container() {
 		log_verbose "env_vars (after): $env_vars"
 		log_verbose "$CMD"
 
-		sh_bin=$(which sh)
+		shell_runcmd=$(which sh)
+
+		if [ "$(id -u)" -eq 0 ]; then
+			if which unshare >/dev/null 2>&1; then
+				unshare_flags=""
+				if [ -d "/proc/self/ns/net" ]; then
+					unshare_flags="$unshare_flags -n"
+					CMD="ip link set lo up
+					$CMD"
+				fi
+				shell_runcmd="unshare $unshare_flags $shell_runcmd"
+			else
+				echo "WARN: no unshare"
+			fi
+		fi
+
+		if [ "$interactive" = 0 ]; then # to support nocker stop/kill for daemons, breaks Ctrl+C for interactive sessions
+			if which setsid >/dev/null 2>&1; then
+				shell_runcmd="setsid $shell_runcmd"
+			else
+				echo "WARN: no setsid"
+			fi
+		fi
 
 		# unexport all host variables
 		unset IFS
@@ -552,28 +677,25 @@ run_in_container() {
 		export HOSTNAME="$container_id"
 
 		for var in $env_vars; do
-			#log_verbose export "${var?}"
+			log_verbose export "${var?}"
 			export "${var?}"
 		done
 
+		PROOT_TMP_DIR="/data/data/com.termux/files/usr/tmp"
+		PREV_TMPDIR="$TMPDIR"
+		export TMPDIR="/tmp"
+
 		#log "env_vars2: $env_vars"
 
-		if which setsid >/dev/null 2>&1; then
-			if [ "$interactive" = 0 ]; then
-				setsid "$sh_bin" -c "$CMD" < /dev/null
-			else
-				setsid "$sh_bin" -c "$CMD"
-			fi
+		if [ "$interactive" = 0 ]; then
+			$shell_runcmd -c "$CMD" < /dev/null
 		else
-			echo "WARN: no setsid"
-			if [ "$interactive" = 0 ]; then
-				$sh_bin -c "$CMD" < /dev/null
-			else
-				$sh_bin -c "$CMD"
-			fi
+			$shell_runcmd -c "$CMD"
 		fi
-		
 		exit_code=$?
+		#log finished: "$shell_runcmd -c \"$CMD\""
+		
+		TMPDIR="$PREV_TMPDIR"
 
 		if [ "$is_main_process" = "true" ]; then
 			exited_at=$(date -u +"%Y-%m-%dT%H:%M:%S")
@@ -591,6 +713,9 @@ run_in_container() {
 				log_verbose "umount 2 $merged_dir$path_in_container"
 				umount -lf "$merged_dir$path_in_container" 2> /dev/null
 			done
+
+			pid=$($JQ_BIN -r .pid "$meta")
+			ip link del "vethh-$pid" >/dev/null 2>&1
 		fi
 		return $exit_code
 	)
@@ -599,13 +724,13 @@ run_in_container() {
 
 cleanup_container() {
 	container_dir=$1
-
+	merged_dir="$container_dir/merged"
 	meta="$container_dir/metadata.json"
 	if [ "$(id -u)" -eq 0 ]; then
-		umount -lf "$container_dir/merged/dev" "$container_dir/merged/sys" "$container_dir/merged/proc" 2> /dev/null
-	fi
-	if [ "$USE_OVERLAYFS" -eq 1 ]; then
-		umount -lf "$container_dir/merged" 2> /dev/null
+		umount -lf "$merged_dir/dev" "$merged_dir/sys" "$merged_dir/proc" 2> /dev/null
+		if [ "$USE_OVERLAYFS" -eq 1 ]; then
+			umount -lf "$merged_dir" 2> /dev/null
+		fi
 	fi
 }
 
@@ -1250,6 +1375,7 @@ run_impl() {
 			$(shell_quote "$volumes") \
 			$(shell_quote "$ports") \
 			$(shell_quote "true") \
+			$(shell_quote "$networks") \
 			$(shell_quote "$final_cmd")"
 		if [ "$detach" = 1 ]; then
 			if [ "$tty_flag" = 1 ] && which tmux >/dev/null 2>&1; then
@@ -1335,6 +1461,7 @@ nk_run() {
 	specified_env_vars=""
 	specified_workdir=""
 	specified_user=""
+	read_only_rootfs=0
 	if [ -z "$container_id" ]; then
 		container_id="$(generate_container_id)"
 	fi
@@ -1422,6 +1549,9 @@ nk_run() {
 					log "Error: $1 requires an argument"
 					exit 1
 				fi
+				;;
+			--read-only)
+				read_only_rootfs=1
 				;;
 			--)
 				shift
@@ -1535,8 +1665,8 @@ nk_start() {
 	$JQ_BIN 'del(.stopped)' "$meta" > tmp && mv tmp "$meta"
 
 	IFS="$(printf '\t')"
-read -r image workdir env_vars status volumes ports command <<EOF
-$($JQ_BIN -r '[.image, .workdir, (.env | join(" ")), .status, (.volumes // ""), (.ports // ""), .command] | @tsv' "$meta")
+read -r image workdir env_vars status volumes ports networks command <<EOF
+$($JQ_BIN -r '[.image, .workdir, (.env | join(" ")), .status, (.volumes // ""), (.ports // ""), (.networks // ""), .command] | @tsv' "$meta")
 EOF
 	#log "read: image=$image workdir=$workdir env_vars=$env_vars status=$status volumes=$volumes ports=$ports command=$command"
 
@@ -1545,7 +1675,7 @@ EOF
 
 
 	#log "Starting container $container_id: $command"
-	run_in_container "$container_id" "$workdir" "$env_vars" "" "$interactive" 0 "$volumes" "$ports" "true" "$command"
+	run_in_container "$container_id" "$workdir" "$env_vars" "" "$interactive" 0 "$volumes" "$ports" "true" "$networks" "$command"
 
 	cleanup_container "$container_dir"
 }
@@ -1603,8 +1733,8 @@ nk_exec() {
 	fi
 
 	IFS="$(printf '\t')"
-read -r workdir env_vars status volumes ports <<EOF
-$($JQ_BIN -r '[.workdir, (.env | join(" ")), .status, (.volumes // ""), (.ports // "")] | @tsv' "$meta")
+read -r workdir env_vars status volumes ports networks <<EOF
+$($JQ_BIN -r '[.workdir, (.env | join(" ")), .status, (.volumes // ""), (.ports // ""), (.networks // "")] | @tsv' "$meta")
 EOF
 
 	if [ "$status" != "running" ]; then
@@ -1613,7 +1743,7 @@ EOF
 	fi
 
 	#log "Executing in container $container_id: $cmd"
-	run_in_container "$container_id" "$workdir" "$env_vars" "$interactive" "$tty_flag" "$volumes" "$ports" "false" "$cmd"
+	run_in_container "$container_id" "$workdir" "$env_vars" "$interactive" "$tty_flag" "$volumes" "$ports" "false" "$networks" "$cmd"
 }
 
 nk_attach() {
@@ -1822,7 +1952,7 @@ image_last_layer_index() {
 	[ -d "$path" ] || continue
 	name=${path##*/}
 	case $name in
-		(''|*[!0-9]*) continue ;;  # пропустить, если не число
+		(''|*[!0-9]*) continue ;;  # skip if not a number
 	esac
 	[ "$name" -gt "$max" ] && max=$name
 	done
@@ -1887,7 +2017,7 @@ commit_layer() {
 		mount_image_dir_layers_overlay "$container_dir" "$dst_image_dir/layers"
 	else
 		set_lower_dirs_for_image "$dst_image_dir/layers"
-		log extract_upper_from_merged "$lower_dirs" "$container_dir/merged" "$new_layer_dir"
+		log_verbose extract_upper_from_merged "$lower_dirs" "$container_dir/merged" "$new_layer_dir"
 		extract_upper_from_merged "$lower_dirs" "$container_dir/merged" "$new_layer_dir"
 	fi
 	log_verbose ln -sf "$REL_GLOBAL_LAYERS_DIR/$new_layer_hash" "$dst_image_dir/layers/$layer_index"
@@ -2082,7 +2212,7 @@ nk_build() {
 	log_file="$container_dir/container.log"
 	meta="$container_dir/metadata.json"
 
-	rm -R "$new_image_dir"
+	rm -R "$new_image_dir" > /dev/null 2>&1 || true
 	log_verbose "new_image_dir: $new_image_dir"
 	log_verbose "container_dir: $container_dir"
 
@@ -2162,10 +2292,13 @@ EOF
 						continue
 					fi
 				fi
+				log_verbose "calling mount_image_dir_layers $container_dir $image_layers_dir/"
 				mount_image_dir_layers "$container_dir" "$image_layers_dir"/
+				log_verbose "done mount_image_dir_layers"
 
 				# TODO if ADD, may unpack archive or download file
 				dst_path_in_container=$(join_root_path "$container_dir/merged/" "$(join_paths "$config_workdir" "$dest")")
+				#log_verbose "dst_path_in_container: $dst_path_in_container"
 
 				#cp -a "$src" "$dst_path_in_container"
 				set -- $src
